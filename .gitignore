@@ -1,0 +1,8 @@
+target/
+dist/
+.DS_Store
+*.log
+node_modules/
+decky/dist/
+!docs/*.log
+design/

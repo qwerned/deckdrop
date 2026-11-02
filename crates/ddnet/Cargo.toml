@@ -1,0 +1,8 @@
+[package]
+name = "ddnet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc.workspace = true
+socket2.workspace = true

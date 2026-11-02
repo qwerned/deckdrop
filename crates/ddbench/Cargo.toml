@@ -1,0 +1,16 @@
+[package]
+name = "ddbench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ddnet = { path = "../ddnet" }
+libc.workspace = true
+quinn = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+blake3 = "1"
+ring = "0.17"

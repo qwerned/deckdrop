@@ -1,0 +1,11 @@
+{
+  "name": "DeckDrop",
+  "author": "deckdrop",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["file-transfer"],
+    "description": "Быстрая передача файлов между Steam Deck и другими устройствами",
+    "image": ""
+  }
+}
