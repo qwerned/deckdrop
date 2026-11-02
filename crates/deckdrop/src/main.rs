@@ -7,6 +7,7 @@ mod ctl;
 mod engine;
 #[cfg(feature = "gui")]
 mod gui;
+mod log;
 mod node;
 mod stream;
 

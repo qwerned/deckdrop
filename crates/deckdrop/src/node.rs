@@ -2,6 +2,7 @@
 use crate::channel::{Channel, T_BEAT};
 use crate::crypto::{self, hex, unhex};
 use crate::engine::{self, Decision, OfferInfo, Outcome, SendPlan, Shared};
+use crate::log::dlog;
 use crate::stream::{self, Manifest, BLOCK};
 use ddnet::UdpSock;
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8] = b"DDS1";
@@ -212,7 +213,11 @@ struct NodeInner {
 
 pub struct Node {
     inner: Mutex<NodeInner>,
-    svc: UdpSock,
+    svc: RwLock<Arc<UdpSock>>,
+    /// Когда служебный сокет последний раз получил что-то от сопряжённого устройства.
+    peer_rx_at: Mutex<Instant>,
+    rebind_at: Mutex<Instant>,
+    rebinds: std::sync::atomic::AtomicU32,
 }
 
 fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -330,12 +335,8 @@ impl Node {
             }
         };
         let port: u16 = std::env::var("DECKDROP_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(52790);
-        let svc = UdpSock::bind(format!("0.0.0.0:{port}").parse().unwrap(), 1 << 20, 1 << 20)?;
-        unsafe {
-            let on: libc::c_int = 1;
-            libc::setsockopt(svc.fd(), libc::SOL_SOCKET, libc::SO_BROADCAST, (&on as *const libc::c_int).cast(), 4);
-        }
-        svc.set_recv_timeout(Some(Duration::from_millis(500)))?;
+        let svc = bind_svc(port)?;
+        dlog!("служба запущена: {} ({}), порт {port}, версия {}", me.name, me.id, env!("CARGO_PKG_VERSION"));
         let peers: Vec<PeerRec> = fs::read(dir.join("peers.json")).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
         let accepted: Vec<AcceptedFile> = fs::read(dir.join("accepted.json")).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
         let node = Arc::new(Node {
@@ -356,7 +357,10 @@ impl Node {
                 inhibitor: None,
                 pending_session: HashMap::new(),
             }),
-            svc,
+            svc: RwLock::new(Arc::new(svc)),
+            peer_rx_at: Mutex::new(Instant::now()),
+            rebind_at: Mutex::new(Instant::now()),
+            rebinds: std::sync::atomic::AtomicU32::new(0),
         });
         {
             let n = node.clone();
@@ -387,7 +391,7 @@ impl Node {
     fn send_msg(&self, m: &Msg, to: SocketAddr) {
         let mut b = MAGIC.to_vec();
         b.extend_from_slice(&serde_json::to_vec(m).unwrap_or_default());
-        let _ = self.svc.send_to(&b, to);
+        let _ = self.svc().send_to(&b, to);
     }
 
     // ---------- обнаружение ----------
@@ -448,15 +452,63 @@ impl Node {
     fn service_loop(self: Arc<Self>) {
         let mut buf = vec![0u8; 16384];
         loop {
-            let (n, from) = match self.svc.recv_from(&mut buf) {
+            let r = self.svc().recv_from(&mut buf);
+            let (n, from) = match r {
                 Ok(x) => x,
-                Err(_) => continue,
+                Err(_) => {
+                    self.heal_svc();
+                    continue;
+                }
             };
             if n < MAGIC.len() || &buf[..MAGIC.len()] != MAGIC {
                 continue;
             }
             let Ok(m) = serde_json::from_slice::<Msg>(&buf[MAGIC.len()..n]) else { continue };
             self.clone().on_msg(m, from);
+        }
+    }
+
+    fn svc(&self) -> Arc<UdpSock> {
+        self.svc.read().unwrap().clone()
+    }
+
+    /// После сна Deck служба на Маке однажды перестала получать пакеты, хотя новый сокет того же процесса
+    /// их получал. Причину найти не удалось, поэтому при долгой тишине от сопряжённых устройств сокет пересоздаётся.
+    fn heal_svc(&self) {
+        let (port, has_peers) = {
+            let g = self.inner.lock().unwrap();
+            (g.port, !g.peers.is_empty())
+        };
+        let quiet = self.peer_rx_at.lock().unwrap().elapsed();
+        if !has_peers || quiet < SVC_QUIET || self.rebind_at.lock().unwrap().elapsed() < SVC_QUIET {
+            return;
+        }
+        *self.rebind_at.lock().unwrap() = Instant::now();
+        // Порт освобождается, только когда закрыт старый сокет: на время ставим временный.
+        let Ok(tmp) = bind_svc(0) else { return };
+        let old = std::mem::replace(&mut *self.svc.write().unwrap(), Arc::new(tmp));
+        drop(old);
+        for _ in 0..30 {
+            if let Ok(s) = bind_svc(port) {
+                *self.svc.write().unwrap() = Arc::new(s);
+                // Пока устройство спит, сокет пересоздаётся каждые 30 с; в журнал идёт первый раз и каждый двадцатый.
+                let n = self.rebinds.fetch_add(1, Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(20) {
+                    dlog!("служебный сокет пересоздан ({n}-й раз подряд): от сопряжённых устройств тишина {} с", quiet.as_secs());
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        dlog!("не удалось заново занять порт {port}, служба пока работает на временном сокете");
+    }
+
+    fn peer_heard(&self, name: &str, was_online: bool, from: SocketAddr) {
+        *self.peer_rx_at.lock().unwrap() = Instant::now();
+        let n = self.rebinds.swap(0, Relaxed);
+        if !was_online {
+            let after = if n > 0 { format!(", сокет пересоздавался {n} раз") } else { String::new() };
+            dlog!("{name} в сети: {from}{after}");
         }
     }
 
@@ -469,6 +521,10 @@ impl Node {
                 }
                 let addr = SocketAddr::new(from.ip(), port);
                 // Адрес сопряжённого устройства обновляет только запечатанное сообщение.
+                if let Some(p) = g.peers.get(&id) {
+                    let was = g.seen.get(&id).is_some_and(|s| s.at.elapsed() < ONLINE_FOR);
+                    self.peer_heard(&p.name, was, from);
+                }
                 let e = g.seen.entry(id.clone()).or_insert(Seen { name: name.clone(), addr, at: Instant::now(), roots: vec![] });
                 e.name = name;
                 e.at = Instant::now();
@@ -487,6 +543,8 @@ impl Node {
                 let (Some(k), Some(mut b)) = (sealed_key(&p.psk), unhex(&blob)) else { return };
                 let Some(n) = k.open(nonce, peer.as_bytes(), &mut b) else { return };
                 let Ok(body) = serde_json::from_slice::<StatusBody>(&b[..n]) else { return };
+                let was = g.seen.get(&peer).is_some_and(|s| s.at.elapsed() < ONLINE_FOR);
+                self.peer_heard(&p.name, was, from);
                 let addr = SocketAddr::new(from.ip(), from.port());
                 let e = g.seen.entry(peer.clone()).or_insert(Seen { name: p.name.clone(), addr, at: Instant::now(), roots: vec![] });
                 e.addr = addr;
@@ -732,7 +790,7 @@ impl Node {
         let mut acc = None;
         for _ in 0..16 {
             // Запрос уходит с сокета службы: ответ придёт на него же и пройдёт через брандмауэр.
-            let _ = self.svc.send_to(&b, addr);
+            let _ = self.svc().send_to(&b, addr);
             if let Ok(m) = rx.recv_timeout(Duration::from_millis(250)) {
                 acc = Some(m);
                 break;
@@ -740,6 +798,7 @@ impl Node {
         }
         self.inner.lock().unwrap().pending_session.remove(&session);
         let Some(Msg::SessAcc { port, eph, mac, .. }) = acc else {
+            dlog!("{addr} не ответил на запрос сессии");
             return Err("устройство не отвечает".into());
         };
         let eph_b = unhex(&eph).ok_or("плохой ответ")?;
@@ -813,6 +872,9 @@ impl Node {
                 j.message = r;
                 j.finished_at = Some(now_unix());
             }
+        }
+        if let Some(j) = g.jobs.get(&id) {
+            dlog!("приём {id} «{}»: {} {}", j.name, j.state, j.message);
         }
     }
 
@@ -988,6 +1050,9 @@ impl Node {
     fn set_state(&self, id: &str, st: &str, msg: &str) {
         let mut g = self.inner.lock().unwrap();
         if let Some(j) = g.jobs.get_mut(id) {
+            if j.state != st || j.message != msg {
+                dlog!("отправка {id} «{}»: {st} {msg}", j.name);
+            }
             j.state = st.into();
             j.message = msg.into();
             if matches!(st, "done" | "failed" | "cancelled" | "declined") {
@@ -1293,6 +1358,18 @@ fn check_dest(o: &OfferInfo, dest: &Path, exclude: &[String]) -> Result<(), Stri
         return Err(format!("не удалось создать {}", dest.display()));
     }
     Ok(())
+}
+
+const SVC_QUIET: Duration = Duration::from_secs(30);
+
+fn bind_svc(port: u16) -> std::io::Result<UdpSock> {
+    let svc = UdpSock::bind(format!("0.0.0.0:{port}").parse().unwrap(), 1 << 20, 1 << 20)?;
+    unsafe {
+        let on: libc::c_int = 1;
+        libc::setsockopt(svc.fd(), libc::SOL_SOCKET, libc::SO_BROADCAST, (&on as *const libc::c_int).cast(), 4);
+    }
+    svc.set_recv_timeout(Some(Duration::from_millis(500)))?;
+    Ok(svc)
 }
 
 fn tree_size(p: &Path) -> u64 {
