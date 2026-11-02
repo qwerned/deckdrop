@@ -157,4 +157,6 @@ Wi-Fi 5 ГГц, 160 МГц, 2161 Мбит/с, Deck −57 дБм. Скорост�
 - `decky/`: панель для Decky Loader.
 - `scripts/`: сборка, установка и проверки целиком (`e2e-*`, `big-test*`, `bench-wifi`).
 
-Шрифты IBM Plex распространяются по лицензии SIL OFL, текст в `crates/deckdrop/assets/OFL-IBM-Plex.txt`.
+## Лицензия
+
+Код распространяется по лицензии [MIT](LICENSE). Шрифты IBM Plex распространяются по лицензии SIL OFL, текст в `crates/deckdrop/assets/OFL-IBM-Plex.txt`.
